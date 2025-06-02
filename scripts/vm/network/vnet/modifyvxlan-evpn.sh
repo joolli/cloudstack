@@ -36,12 +36,13 @@
 #
 
 DSTPORT=4789
+#SVDtunnelDev=""
 
 # We bind our VXLAN tunnel IP(v4) on Loopback device 'lo'
 DEV="lo"
 
 usage() {
-    echo "Usage: $0: -o <op>(add | delete) -v <vxlan id> -p <pif> -b <bridge name> (-6)"
+    echo "Usage: $0: -o <op>(add | delete) -v <vxlan id> -p <pif> -b <bridge name> (-6) -d <delete bridge>(true|false)"
 }
 
 localAddr() {
@@ -55,6 +56,121 @@ localAddr() {
        ip -6 -o addr show scope global dev ${DEV} | awk 'NR==1 {gsub("/[0-9]+", "") ; print $4}'
     fi
 }
+
+addVxlanSVD() {
+    local VNI=$1
+    local PIF=$2
+    local VLAN_BR=$3
+    local FAMILY=$4
+    local VXLAN_DEV=$SVDtunnelDev
+    local VETHPEER="$(ip link show type veth dev $PIF | grep -o -P '(?<=@).*(?=:)')"
+    local VlanAwareBR="$(readlink /sys/class/net/$VETHPEER/master | sed 's#../##')"
+    local availVlan=$(findAvailVlan $VlanAwareBR)
+    
+    echo " - vlan aware bridge is $VlanAwareBR, allocated vlan to add: $availVlan"
+
+    if vni_is_used ${VNI}; then
+	 echo " - VNI: $VNI, already allocated."
+	 if ip link show dev ${VLAN_BR}; then
+            echo " - Bridge, $VLAN_BR already created, nothing to do."
+	    exit 0
+	 fi
+	 echo " - Bridge, $VLAN_BR, not found. May have been created externally."
+	 exit 1
+    fi
+
+    bridge vlan add vid ${availVlan} dev ${VlanAwareBR} self
+    if [ $? -gt 0 ]; then 
+        echo "command \"bridge vlan add vid ${availVlan} dev ${VlanAwareBR} self\" failed"
+        return 1
+    fi
+    bridge vlan add vid ${availVlan} dev ${VETHPEER}
+    if [ $? -gt 0 ]; then 
+        echo "command \"bridge vlan add vid ${availVlan} dev ${VETHPEER}\" failed"
+        return 1
+    fi
+    bridge vlan add vid ${availVlan} dev ${VXLAN_DEV}
+    if [ $? -gt 0 ]; then 
+        echo "command \"bridge vlan add vid ${availVlan} dev ${VXLAN_DEV}\" failed"
+        return 1
+    fi
+    bridge vlan add vid ${availVlan} tunnel_info id ${VNI} dev ${VXLAN_DEV}
+    if [ $? -gt 0 ]; then 
+        echo "command \"bridge vlan add vid ${availVlan} tunnel_info id ${VNI} dev ${VXLAN_DEV}\" failed"
+        return 1
+    fi
+    addVlan $availVlan $PIF $VLAN_BR
+    return 0
+}
+ 
+
+addVlan() {
+    local vlanId=$1
+    local pif=$2
+    local vlanDev=$pif.$vlanId
+    local vlanBr=$3
+
+    if [ ! -d /sys/class/net/$vlanDev ]
+    then
+        ip link add link $pif name $vlanDev type vlan id $vlanId > /dev/null
+        echo 1 > /proc/sys/net/ipv6/conf/$vlanDev/disable_ipv6
+        ip link set $vlanDev up
+
+        if [ $? -gt 0 ]
+        then
+            # race condition that someone already creates the vlan
+            if [ ! -d /sys/class/net/$vlanDev ]
+            then
+                printf "Failed to create vlan $vlanId on pif: $pif."
+                return 1
+            fi
+        fi
+    fi
+
+    # disable IPv6
+    echo 1 > /proc/sys/net/ipv6/conf/$vlanDev/disable_ipv6
+    # is up?
+    ip link set $vlanDev up > /dev/null 2>/dev/null
+
+    if [ ! -d /sys/class/net/$vlanBr ]
+    then
+        ip link add name $vlanBr type bridge
+        echo 1 > /proc/sys/net/ipv6/conf/$vlanBr/disable_ipv6
+        ip link set $vlanBr up
+
+        if [ $? -gt 0 ]
+        then
+            if [ ! -d /sys/class/net/$vlanBr ]
+            then
+               printf "Failed to create br: $vlanBr"
+               return 2
+            fi
+        fi
+    fi
+
+    #pif is eslaved into vlanBr?
+    ls /sys/class/net/$vlanBr/brif/ |grep -w "$vlanDev" > /dev/null
+    if [ $? -gt 0 ]
+    then
+        ip link set $vlanDev master $vlanBr
+        if [ $? -gt 0 ]
+        then
+            ls /sys/class/net/$vlanBr/brif/ |grep -w "$vlanDev" > /dev/null
+            if [ $? -gt 0 ]
+            then
+                printf "Failed to add vlan: $vlanDev to $vlanBr"
+                return 3
+            fi
+        fi
+    fi
+    # disable IPv6
+    echo 1 > /proc/sys/net/ipv6/conf/$vlanBr/disable_ipv6
+    # is vlanBr up?
+    ip link set $vlanBr up > /dev/null 2>/dev/null
+
+    return 0
+}
+
 
 addVxlan() {
     local VNI=$1
@@ -82,6 +198,72 @@ addVxlan() {
     if [[ $? -gt 0 ]]; then
         ip link set ${VXLAN_DEV} master ${VXLAN_BR}
     fi
+
+    if [[ ! -d /sys/class/net/$VXLAN_BR ]]; then
+        ip link add name ${VXLAN_BR} type bridge
+        ip link set ${VXLAN_BR} up
+        sysctl -qw net.ipv6.conf.${VXLAN_BR}.disable_ipv6=1
+    fi
+
+    bridge link show|grep ${VXLAN_BR}|awk '{print $2}'|grep "^${VXLAN_DEV}\$" > /dev/null
+    if [[ $? -gt 0 ]]; then
+        ip link set ${VXLAN_DEV} master ${VXLAN_BR}
+    fi
+}
+
+deleteVxlanSVD() {
+    local VNI=$1
+    local PIF=$2
+    local VLAN_BR=$3
+    local FAMILY=$4
+    local deleteBr=$5
+    local VXLAN_DEV=$SVDtunnelDev
+    local VETHPEER="$(ip link show type veth dev $PIF | grep -o -P '(?<=@).*(?=:)')"
+    local VlanAwareBR="$(readlink /sys/class/net/$VETHPEER/master | sed 's#../##')"
+
+    VLAN=$(get_vlan_vni_map | grep -w $VNI | awk '{ print $1 }')
+    echo "VLAN aware bridge is: $VlanAwareBR, VLAN to delete: $VLAN"
+
+    deleteVlan $VLAN $PIF $VLAN_BR $deleteBr
+
+    bridge vlan del vid ${VLAN} dev ${VlanAwareBR} self
+    bridge vlan del vid ${VLAN} dev ${VXLAN_DEV} 
+    bridge vlan del vid ${VLAN} dev ${VXLAN_DEV} tunnel_info id ${VNI}
+    bridge vlan del vid ${VLAN} dev ${VETHPEER}
+}
+
+deleteVlan() {
+    local vlanId=$1
+    local pif=$2
+    local vlanDev=$pif.$vlanId
+    local vlanBr=$3
+    local deleteBr=$4
+
+    if [ "$deleteBr" == "true" ]
+    then
+        ip link delete $vlanDev type vlan > /dev/null
+
+        if [ $? -gt 0 ]
+        then
+            printf "Failed to del vlan: $vlanId"
+            return 1
+        fi
+        ip link set $vlanBr down
+
+        if [ $? -gt 0 ]
+        then
+            return 1
+        fi
+
+        ip link delete $vlanBr type bridge
+
+        if [ $? -gt 0 ]
+        then
+            printf "Failed to del bridge $vlanBr"
+            return 1
+        fi
+    fi
+    return 0
 }
 
 deleteVxlan() {
@@ -98,12 +280,79 @@ deleteVxlan() {
     ip link delete ${VXLAN_BR} type bridge
 }
 
+findAvailVlan() {
+    local BRIDGE=$1
+    local START_VLAN=1
+    local MAX_VLAN=4094
+    local vlan_array=""
+    local allocatedVlans="$(bridge vlan show dev "$BRIDGE" | awk '{for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) print $i}' | sort -n | uniq)"
+
+    readarray -t vlan_array <<<"$allocatedVlans"
+
+    for ((vlan=$START_VLAN; vlan<=$MAX_VLAN; vlan++)); do
+        if ! [[ " ${vlan_array[*]} " =~ " $vlan " ]]; then
+            echo $vlan
+            return 0
+        fi
+    done
+
+    echo "No available VLAN IDs found." >&2
+    return 1
+}
+
+vni_is_used() {
+    local vni=$1
+    get_vlan_vni_map | awk -v vni="$vni" '$2 == vni { found=1 } END { exit !found }'
+}
+
+get_vlan_vni_map() {
+    bridge -j vlan tunnelshow | awk '
+    {
+        # Extract each tunnel object using regex
+        while (match($0, /\{[^}]*"vlan":[^}]*\}/)) {
+            obj = substr($0, RSTART, RLENGTH)
+
+            # Clean and normalize
+            gsub(/[:,{}"]/, " ", obj)
+
+            vlan = vlanEnd = tunid = tunidEnd = ""
+
+            # Parse fields from the mini object
+            n = split(obj, kvs, " ")
+            for (i = 1; i <= n; i++) {
+                if (kvs[i] == "vlan")     vlan = kvs[i+1]
+                if (kvs[i] == "vlanEnd")  vlanEnd = kvs[i+1]
+                if (kvs[i] == "tunid")    tunid = kvs[i+1]
+                if (kvs[i] == "tunidEnd") tunidEnd = kvs[i+1]
+            }
+
+            if (vlan != "" && tunid != "") {
+                start_vlan = vlan + 0
+                start_tunid = tunid + 0
+
+                if (vlanEnd != "" && tunidEnd != "") {
+                    end_vlan = vlanEnd + 0
+                    for (i = 0; i <= end_vlan - start_vlan; i++) {
+                        printf "%d %d\n", start_vlan + i, start_tunid + i
+                    }
+                } else {
+                    printf "%d %d\n", start_vlan, start_tunid
+                }
+            }
+
+            # Remove processed object and continue
+            $0 = substr($0, RSTART + RLENGTH)
+        }
+    }'
+}
+
+
 OP=
 VNI=
 FAMILY=inet
 option=$@
 
-while getopts 'o:v:p:b:6' OPTION
+while getopts 'o:v:p:b:d:6' OPTION
 do
   case $OPTION in
   o)    oflag=1
@@ -117,6 +366,9 @@ do
         ;;
   b)    bflag=1
         BRNAME="$OPTARG"
+        ;;
+  d)    dflag=1
+        deleteBr="$OPTARG"
         ;;
   6)
         FAMILY=inet6
@@ -141,6 +393,23 @@ if [[ $? -gt 0 ]]; then
     fi
 fi
 
+SVDtunnelDev=$(ip -d link show type vxlan | awk '
+               /^[0-9]+: / { iface = $2; sub(":", "", iface); } 
+	       /vlan_tunnel on/ { print iface; } ') 
+
+tundevMaster=$(ip link show dev $SVDtunnelDev type vxlan | awk '
+               /master/ {for(i=1;i<=NF;i++) if($i=="master") print $(i+1)}')
+
+if [[ $SVDtunnelDev != "" ]]; then
+        echo "Info: Found Single VXLAN Device (SVD) setup (vlan_tunnel attr turned on)"
+	if [[ $(ip -d link show dev $tundevMaster | awk '/vlan_filtering 1/') == "" ]]; then
+            echo "Found a vxlan interface for SVD topology but master bridge: $tundevMaster, does not have vlan_filtering enabled"
+            exit 1
+	fi
+fi
+
+
+echo "VXLAN dev: $SVDtunnelDev"
 
 #
 # Add a lockfile to prevent this script from running twice on the same host
@@ -152,12 +421,20 @@ LOCKFILE=/var/run/cloud/vxlan.lock
 (
     flock -x -w 10 200 || exit 1
     if [[ "$OP" == "add" ]]; then
-        addVxlan ${VNI} ${PIF} ${BRNAME} ${FAMILY}
+	    if [[ $SVDtunnelDev != "" ]]; then
+	        addVxlanSVD ${VNI} ${PIF} ${BRNAME} ${FAMILY} 
+	    else
+        	addVxlan ${VNI} ${PIF} ${BRNAME} ${FAMILY}
+	    fi
 
         if [[ $? -gt 0 ]]; then
             exit 1
         fi
     elif [[ "$OP" == "delete" ]]; then
-        deleteVxlan ${VNI} ${PIF} ${BRNAME} ${FAMILY}
+        if [[ $SVDtunnelDev != "" ]]; then
+            deleteVxlanSVD ${VNI} ${PIF} ${BRNAME} ${FAMILY} ${deleteBr}
+        else
+            deleteVxlan ${VNI} ${PIF} ${BRNAME} ${FAMILY}
+        fi
     fi
 ) 200>${LOCKFILE}
